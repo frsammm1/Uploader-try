@@ -3,6 +3,7 @@ import re
 import asyncio
 import aiohttp
 import aiofiles
+import ssl
 from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -55,8 +56,18 @@ async def download_pdf(url: str, filename: str, progress_msg: Message, user_id: 
     try:
         filepath = DOWNLOAD_DIR / filename
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600)) as response:
+        # Create SSL context that doesn't verify certificates
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3600)) as response:
                 if response.status == 200:
                     total_size = int(response.headers.get('content-length', 0))
                     downloaded = 0
@@ -91,23 +102,53 @@ async def download_pdf(url: str, filename: str, progress_msg: Message, user_id: 
 
 async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Message, user_id: int) -> Optional[str]:
     try:
-        output_path = DOWNLOAD_DIR / filename
+        output_path = DOWNLOAD_DIR / filename.replace('.mp4', '')
         
+        # Advanced yt-dlp options with SSL fix
         ydl_opts = {
-            'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]',
-            'outtmpl': str(output_path.with_suffix('')),
+            'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
+            'outtmpl': str(output_path),
             'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
-            'concurrent_fragment_downloads': 4,
-            'buffersize': 1024 * 256,
-            'http_chunk_size': 1024 * 1024,
-            'retries': 10,
-            'fragment_retries': 10,
+            'quiet': False,
+            'no_warnings': False,
+            'verbose': True,
+            
+            # SSL and connection fixes
             'nocheckcertificate': True,
+            'no_check_certificate': True,
+            'prefer_insecure': True,
+            
+            # Headers
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            },
+            
+            # Download settings
+            'concurrent_fragment_downloads': 5,
+            'retries': 15,
+            'fragment_retries': 15,
+            'skip_unavailable_fragments': True,
+            'keep_fragments': False,
+            
+            # Buffer settings
+            'buffersize': 1024 * 512,
+            'http_chunk_size': 1024 * 1024 * 2,
+            
+            # FFmpeg settings
+            'postprocessor_args': {
+                'ffmpeg': ['-c', 'copy']
+            },
+            
+            # Geo bypass
+            'geo_bypass': True,
+            'geo_bypass_country': 'IN',
         }
         
-        last_percent = [0]
+        last_status = {'percent': 0, 'speed': 0}
         
         def progress_hook(d):
             if not active_downloads.get(user_id, False):
@@ -115,33 +156,67 @@ async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Mes
             
             if d['status'] == 'downloading':
                 try:
-                    percent = d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100
-                    if int(percent) - last_percent[0] >= 5:
-                        last_percent[0] = int(percent)
-                        asyncio.create_task(
-                            progress_msg.edit_text(
-                                f"📥 Downloading video...\n"
-                                f"Progress: {percent:.1f}%\n"
-                                f"Speed: {d.get('speed', 0)/(1024*1024):.2f} MB/s"
+                    total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                    downloaded = d.get('downloaded_bytes', 0)
+                    
+                    if total > 0:
+                        percent = (downloaded / total) * 100
+                        speed = d.get('speed', 0) or 0
+                        
+                        # Update every 5%
+                        if int(percent) - last_status['percent'] >= 5:
+                            last_status['percent'] = int(percent)
+                            last_status['speed'] = speed
+                            
+                            asyncio.create_task(
+                                progress_msg.edit_text(
+                                    f"📥 Downloading video...\n"
+                                    f"Progress: {percent:.1f}%\n"
+                                    f"Downloaded: {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
+                                    f"Speed: {speed/(1024*1024):.2f} MB/s"
+                                )
                             )
-                        )
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Progress hook error: {e}")
+            
+            elif d['status'] == 'finished':
+                asyncio.create_task(progress_msg.edit_text("🔄 Converting to MP4..."))
         
         ydl_opts['progress_hooks'] = [progress_hook]
         
+        # Download with yt-dlp
+        logger.info(f"Starting download for: {url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            await asyncio.get_event_loop().run_in_executor(None, ydl.download, [url])
+            info = await asyncio.get_event_loop().run_in_executor(None, ydl.extract_info, url, True)
+            logger.info(f"Download info: {info.get('title', 'Unknown')}")
         
-        for ext in ['.mp4', '.mkv', '.webm']:
-            possible_path = output_path.with_suffix(ext)
+        # Find output file
+        for ext in ['.mp4', '.mkv', '.webm', '.ts']:
+            possible_path = Path(str(output_path) + ext)
             if possible_path.exists():
+                logger.info(f"Found file: {possible_path}")
+                
+                # If not MP4, rename to MP4
+                if ext != '.mp4':
+                    mp4_path = possible_path.with_suffix('.mp4')
+                    os.rename(possible_path, mp4_path)
+                    return str(mp4_path)
+                
                 return str(possible_path)
         
-        return str(output_path.with_suffix('.mp4')) if output_path.with_suffix('.mp4').exists() else None
+        # Try without extension
+        if Path(str(output_path) + '.mp4').exists():
+            return str(output_path) + '.mp4'
+        
+        logger.error(f"No output file found for: {output_path}")
+        return None
         
     except Exception as e:
-        logger.error(f"M3U8 download error: {e}")
+        logger.error(f"M3U8 download error: {e}", exc_info=True)
+        try:
+            await progress_msg.edit_text(f"❌ Download failed: {str(e)[:100]}")
+        except:
+            pass
         return None
 
 
@@ -151,7 +226,10 @@ async def start_command(client: Client, message: Message):
         "🎬 **M3U8 Video Downloader Bot**\n\n"
         "📝 Send me a TXT/HTML file with M3U8 and PDF links\n"
         "🎯 Select quality: 360p, 480p, 720p, 1080p\n"
-        "📥 I'll download and send everything!"
+        "📥 I'll download and send everything!\n\n"
+        "Format:\n"
+        "`[Title] Name : https://url.com/video.m3u8`\n"
+        "`[Title] PDF : https://url.com/file.pdf`"
     )
 
 
@@ -190,7 +268,7 @@ async def handle_document(client: Client, message: Message):
                 InlineKeyboardButton("480p", callback_data="quality_480p")
             ],
             [
-                InlineKeyboardButton("720p", callback_data="quality_720p"),
+                InlineKeyboardButton("720p ⭐", callback_data="quality_720p"),
                 InlineKeyboardButton("1080p", callback_data="quality_1080p")
             ]
         ])
@@ -219,11 +297,11 @@ async def quality_callback(client: Client, callback: CallbackQuery):
     active_downloads[user_id] = True
     
     stop_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⛔ Stop", callback_data="stop_download")]
+        [InlineKeyboardButton("⛔ Stop Download", callback_data="stop_download")]
     ])
     
     await callback.message.edit_text(
-        f"🚀 Starting downloads ({quality})...\nTotal: {len(items)}",
+        f"🚀 Starting downloads ({quality})...\nTotal items: {len(items)}",
         reply_markup=stop_keyboard
     )
     
@@ -232,60 +310,88 @@ async def quality_callback(client: Client, callback: CallbackQuery):
     
     for idx, item in enumerate(items, 1):
         if not active_downloads.get(user_id, False):
-            await callback.message.edit_text("⛔ Stopped by user!")
+            await callback.message.reply_text("⛔ Stopped by user!")
             break
         
         progress_msg = await callback.message.reply_text(
-            f"📦 {idx}/{len(items)}: {item['title'][:50]}..."
+            f"📦 [{idx}/{len(items)}] {item['title'][:50]}..."
         )
         
         try:
             if item['type'] == 'video':
                 quality_value = QUALITY_MAP[quality]
                 safe_filename = re.sub(r'[^\w\s-]', '', item['title'])[:50]
-                filename = f"{safe_filename}.mp4"
+                filename = f"{safe_filename}_{quality}.mp4"
                 
+                logger.info(f"Downloading video {idx}: {item['url']}")
                 video_path = await download_m3u8(item['url'], quality_value, filename, progress_msg, user_id)
                 
                 if video_path and active_downloads.get(user_id, False):
-                    await progress_msg.edit_text("📤 Uploading...")
-                    await callback.message.reply_video(
-                        video_path,
-                        caption=f"🎬 {item['title']}\n📊 {quality}",
-                        supports_streaming=True
-                    )
-                    os.remove(video_path)
-                    await progress_msg.delete()
-                    success_count += 1
+                    if os.path.exists(video_path):
+                        file_size = os.path.getsize(video_path) / (1024 * 1024)
+                        logger.info(f"Video downloaded: {video_path}, Size: {file_size:.2f}MB")
+                        
+                        await progress_msg.edit_text("📤 Uploading video...")
+                        
+                        await callback.message.reply_video(
+                            video_path,
+                            caption=f"🎬 {item['title']}\n📊 Quality: {quality}\n💾 Size: {file_size:.1f}MB",
+                            supports_streaming=True,
+                            width=1280,
+                            height=720
+                        )
+                        
+                        os.remove(video_path)
+                        await progress_msg.delete()
+                        success_count += 1
+                    else:
+                        logger.error(f"Video file not found: {video_path}")
+                        await progress_msg.edit_text(f"❌ File not found")
+                        failed_count += 1
                 else:
-                    await progress_msg.edit_text(f"❌ Failed")
+                    await progress_msg.edit_text(f"❌ Download failed")
                     failed_count += 1
                     
             elif item['type'] == 'pdf':
                 safe_filename = re.sub(r'[^\w\s-]', '', item['title'])[:50]
                 filename = f"{safe_filename}.pdf"
                 
+                logger.info(f"Downloading PDF {idx}: {item['url']}")
                 pdf_path = await download_pdf(item['url'], filename, progress_msg, user_id)
                 
                 if pdf_path and active_downloads.get(user_id, False):
-                    await progress_msg.edit_text("📤 Uploading...")
-                    await callback.message.reply_document(pdf_path, caption=f"📄 {item['title']}")
-                    os.remove(pdf_path)
-                    await progress_msg.delete()
-                    success_count += 1
+                    if os.path.exists(pdf_path):
+                        await progress_msg.edit_text("📤 Uploading PDF...")
+                        
+                        await callback.message.reply_document(
+                            pdf_path, 
+                            caption=f"📄 {item['title']}"
+                        )
+                        
+                        os.remove(pdf_path)
+                        await progress_msg.delete()
+                        success_count += 1
+                    else:
+                        await progress_msg.edit_text(f"❌ File not found")
+                        failed_count += 1
                 else:
-                    await progress_msg.edit_text(f"❌ Failed")
+                    await progress_msg.edit_text(f"❌ Download failed")
                     failed_count += 1
         
         except Exception as e:
-            logger.error(f"Error {idx}: {e}")
-            await progress_msg.edit_text(f"❌ Error")
+            logger.error(f"Error processing item {idx}: {e}", exc_info=True)
+            try:
+                await progress_msg.edit_text(f"❌ Error: {str(e)[:50]}")
+            except:
+                pass
             failed_count += 1
         
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
     
+    # Cleanup
     try:
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
     except:
         pass
     
@@ -295,7 +401,10 @@ async def quality_callback(client: Client, callback: CallbackQuery):
         del active_downloads[user_id]
     
     await callback.message.reply_text(
-        f"✅ Complete!\n✔️ Success: {success_count}\n❌ Failed: {failed_count}"
+        f"✅ **Complete!**\n\n"
+        f"✔️ Success: {success_count}\n"
+        f"❌ Failed: {failed_count}\n"
+        f"📊 Total: {len(items)}"
     )
 
 
@@ -303,14 +412,14 @@ async def quality_callback(client: Client, callback: CallbackQuery):
 async def stop_download(client: Client, callback: CallbackQuery):
     user_id = callback.from_user.id
     active_downloads[user_id] = False
-    await callback.answer("⛔ Stopping...", show_alert=True)
+    await callback.answer("⛔ Stopping downloads...", show_alert=True)
 
 
 @app.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
     user_id = message.from_user.id
     active_downloads[user_id] = False
-    await message.reply_text("⛔ Cancelled!")
+    await message.reply_text("⛔ Downloads cancelled!")
 
 
 if __name__ == "__main__":
