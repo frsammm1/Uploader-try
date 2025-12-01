@@ -1,22 +1,16 @@
 FROM python:3.11-slim
 
-# Set working directory
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Install git and other system dependencies
-RUN apt-get update && \
-    apt-get install -y git && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Flask for health check
-RUN pip install --no-cache-dir flask
+COPY main.py .
 
-# Copy the main.py file
-COPY main.py /app/main.py
+RUN mkdir -p downloads
 
-# Expose port
-EXPOSE 8080
+ENV PYTHONUNBUFFERED=1
 
-# Run the application
-CMD ["python3", "/app/main.py"]
+CMD ["python", "main.py"]
