@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+downloads/
+*.mp4
+*.pdf
+*.txt
+*.html
+*.session
+.env
