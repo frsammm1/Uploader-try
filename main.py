@@ -13,7 +13,6 @@ import logging
 import glob
 from aiohttp import web
 import time
-from PIL import Image
 import subprocess
 
 logging.basicConfig(
@@ -43,7 +42,7 @@ QUALITY_MAP = {
     "1080p": "1080",
 }
 
-# Web server for health check
+# Web server
 web_app = web.Application()
 
 async def health_check(request):
@@ -73,7 +72,7 @@ def parse_content(text: str) -> list:
 
 
 def get_video_info(filepath: str) -> dict:
-    """Get video duration and dimensions"""
+    """Get video duration and dimensions using FFprobe"""
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -110,7 +109,7 @@ def get_video_info(filepath: str) -> dict:
 
 
 def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
-    """Generate thumbnail from video"""
+    """Generate thumbnail using FFmpeg"""
     try:
         cmd = [
             'ffmpeg', '-i', video_path,
@@ -120,40 +119,14 @@ def generate_thumbnail(video_path: str, thumb_path: str) -> bool:
             thumb_path,
             '-y'
         ]
-        subprocess.run(cmd, capture_output=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
         
-        if os.path.exists(thumb_path):
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             return True
         return False
     except Exception as e:
         logger.error(f"Thumbnail error: {e}")
         return False
-
-
-async def progress_bar(current, total, start_time, text=""):
-    """Progress bar callback for uploads"""
-    now = time.time()
-    elapsed = now - start_time
-    
-    if elapsed == 0:
-        return
-    
-    percentage = current * 100 / total
-    speed = current / elapsed
-    eta = (total - current) / speed if speed > 0 else 0
-    
-    completed = int(percentage / 5)
-    remaining = 20 - completed
-    bar = "█" * completed + "░" * remaining
-    
-    return (
-        f"{text}\n\n"
-        f"Progress: {percentage:.1f}%\n"
-        f"[{bar}]\n"
-        f"Done: {current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
-        f"Speed: {speed/(1024*1024):.2f} MB/s\n"
-        f"ETA: {int(eta)}s"
-    )
 
 
 async def download_pdf(url: str, filename: str, progress_msg: Message, user_id: int) -> Optional[str]:
@@ -192,9 +165,12 @@ async def download_pdf(url: str, filename: str, progress_msg: Message, user_id: 
                                     percent = (downloaded / total_size * 100) if total_size > 0 else 0
                                     speed = downloaded / (time.time() - start_time)
                                     
+                                    completed = int(percent / 5)
+                                    bar = "█" * completed + "░" * (20 - completed)
+                                    
                                     await progress_msg.edit_text(
                                         f"📥 Downloading PDF...\n\n"
-                                        f"Progress: {percent:.1f}%\n"
+                                        f"[{bar}] {percent:.1f}%\n\n"
                                         f"Size: {downloaded/(1024*1024):.1f}MB / {total_size/(1024*1024):.1f}MB\n"
                                         f"Speed: {speed/(1024*1024):.2f} MB/s"
                                     )
@@ -263,7 +239,7 @@ def download_video_sync(url: str, quality: str, output_path: str, user_id: int) 
 
 
 async def update_progress(progress_msg: Message, user_id: int):
-    """Update progress message periodically"""
+    """Update progress message"""
     last_percent = 0
     
     while active_downloads.get(user_id, False) and user_id in download_progress:
@@ -280,7 +256,6 @@ async def update_progress(progress_msg: Message, user_id: int):
                 speed = prog.get('speed', 0)
                 eta = prog.get('eta', 0)
                 
-                # Progress bar
                 completed = int(percent / 5)
                 bar = "█" * completed + "░" * (20 - completed)
                 
@@ -289,10 +264,10 @@ async def update_progress(progress_msg: Message, user_id: int):
                     f"[{bar}] {percent:.1f}%\n\n"
                     f"Downloaded: {downloaded/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB\n"
                     f"Speed: {speed/(1024*1024):.2f} MB/s\n"
-                    f"ETA: {int(eta)}s remaining"
+                    f"ETA: {int(eta)}s"
                 )
         except Exception as e:
-            logger.error(f"Progress update error: {e}")
+            logger.error(f"Progress error: {e}")
         
         await asyncio.sleep(2)
 
@@ -302,7 +277,7 @@ async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Mes
     output_path = str(DOWNLOAD_DIR / temp_name)
     
     try:
-        download_progress[user_id] = {'percent': 0, 'downloaded': 0, 'total': 0, 'speed': 0}
+        download_progress[user_id] = {'percent': 0}
         
         await progress_msg.edit_text("📥 Starting download...")
         
@@ -312,7 +287,7 @@ async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Mes
         loop = asyncio.get_event_loop()
         success = await loop.run_in_executor(None, download_video_sync, url, quality, output_path, user_id)
         
-        # Stop progress updater
+        # Stop progress
         if user_id in download_progress:
             del download_progress[user_id]
         
@@ -324,7 +299,7 @@ async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Mes
         if not success:
             return None
         
-        await progress_msg.edit_text("🔄 Processing video...")
+        await progress_msg.edit_text("🔄 Processing...")
         await asyncio.sleep(1)
         
         # Find file
@@ -364,13 +339,13 @@ async def download_m3u8(url: str, quality: str, filename: str, progress_msg: Mes
 async def start_cmd(client: Client, message: Message):
     await message.reply_text(
         "🎬 **M3U8 Downloader Bot v6.1**\n\n"
-        "📝 Send TXT/HTML file with links\n"
+        "📝 Send TXT/HTML file\n"
         "🎯 Quality: 360p-1080p\n\n"
-        "**New Features:**\n"
+        "**Features:**\n"
         "✨ Video thumbnails\n"
         "✨ Duration display\n"
-        "✨ Progress bar\n"
-        "✨ Speed & ETA\n\n"
+        "✨ Progress bars\n"
+        "✨ Speed tracking\n\n"
         "Format: `[Title] : https://url.m3u8`"
     )
 
@@ -464,17 +439,16 @@ async def quality_cb(client: Client, callback: CallbackQuery):
                     fsize = os.path.getsize(vpath) / (1024 * 1024)
                     
                     # Get video info
-                    await prog.edit_text("🎬 Getting video info...")
+                    await prog.edit_text("🎬 Getting info...")
                     video_info = get_video_info(vpath)
                     
                     # Generate thumbnail
                     thumb_path = str(DOWNLOAD_DIR / f"thumb_{user_id}_{idx}.jpg")
-                    await prog.edit_text("📸 Generating thumbnail...")
+                    await prog.edit_text("📸 Creating thumbnail...")
                     has_thumb = generate_thumbnail(vpath, thumb_path)
                     
-                    # Upload with progress
+                    # Upload
                     await prog.edit_text("📤 Uploading video...")
-                    start_time = time.time()
                     
                     await callback.message.reply_video(
                         vpath,
@@ -483,12 +457,7 @@ async def quality_cb(client: Client, callback: CallbackQuery):
                         duration=video_info['duration'],
                         width=video_info['width'],
                         height=video_info['height'],
-                        thumb=thumb_path if has_thumb else None,
-                        progress=lambda c, t: asyncio.create_task(
-                            prog.edit_text(
-                                asyncio.run(progress_bar(c, t, start_time, "📤 Uploading video..."))
-                            ) if int((c/t)*100) % 10 == 0 else asyncio.sleep(0)
-                        )
+                        thumb=thumb_path if has_thumb else None
                     )
                     
                     # Cleanup
@@ -573,4 +542,19 @@ async def cancel_cmd(client: Client, message: Message):
 async def main():
     # Start web server
     runner = web.AppRunner(web_app)
-  
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"✅ Web server on {PORT}")
+    
+    # Start bot
+    await app.start()
+    logger.info("✅ Bot v6.1 started!")
+    
+    # Keep alive
+    await idle()
+
+
+if __name__ == "__main__":
+    logger.info("🚀 Starting v6.1...")
+    app.run(main())
